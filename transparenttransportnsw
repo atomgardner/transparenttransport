@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+die()
+{
+	>&2 echo "$1"
+	exit 1
+}
+
+check_dependencies()
+{
+	command -v jq >/dev/null 2>&1 || \
+		die 'transparenttransport requires `jq` for JSON parsing'
+	command -v curl >/dev/null 2>&1 || \
+		die 'transparenttransport requires `curl` for sending HTTP'
+}
+
+usage()
+{
+	cat <<-_EOF
+	usage: transparenttransport <stop id>
+
+	For slicker UX, set TRANSPARENTTRANSPORT_DEFAULT to your favourite stop
+	id, and drop the argument. And a couple other variables are supported
+	for convenience:
+	    /\ TRANSPARENTTRANSPORT_HOME
+	    /\ TRANSPARENTTRANSPORT_WORK
+	_EOF
+}
+
+get_stop_finder_id()
+{
+	local stop_finder_name stop_finder_id
+	[[ -z $1 ]] && die "must specify stop id"
+
+	stop_finder_url="https://transportnsw.info/web/XML_STOPFINDER_REQUEST"
+	stop_finder_url+="?coordOutputFormat=EPSG:4326"
+	stop_finder_url+="&name_sf=$1"
+	stop_finder_url+="&outputFormat=rapidJSON"
+	stop_finder_url+="&type_sf=any"
+	stop_finder_url+="&version=10.2.2.48"
+	stop_finder_url+="&TfNSWSFStopsOnly=true"
+
+	# seems like stop_find_id usually just prepends a `G` to the stop id
+	IFS=$'\t' read -r stop_finder_name stop_finder_id < \
+		<(curl -s "$stop_finder_url" |jq 2>/dev/null -r \
+			'.locations[] |[.name, .id] |@tsv')
+
+	[[ -z "$stop_finder_name" ]] && \
+		die "couldn't transform stop id $stop_id into anything useful"
+	echo "$stop_finder_name" >&2
+	echo "$stop_finder_id"
+}
+
+print_timetable()
+{
+	local timetable_url
+	[[ -z $1 ]] && die "must specify stop finder id"
+
+	timetable_url="https://transportnsw.info"
+	timetable_url+="/api/trip/v1/departure-list-request"
+	timetable_url+="?date=$(date +%Y%m%d)"
+	timetable_url+="&depArrMacro=dep"
+	timetable_url+="&depType=stopEvents"
+	timetable_url+="&name=$1"
+	timetable_url+="&time=$(date +%H%M)"
+	timetable_url+="&type=platform"
+
+	# need some slick UX
+	printf "number\tdeparture time\t\tdestination\n"
+	curl --silent "$timetable_url" |jq 2>/dev/null -r '.stopEvents[] | [
+		.transportation.number,
+		(
+			.departureTime
+			|fromdateiso8601
+			|strflocaltime("%Y-%m-%dT%H:%M:%S")
+		),
+		.transportation.destination.name
+		] |@tsv'
+}
+
+check_dependencies
+
+stop_id=
+
+case $1 in
+	--help|help|-h)
+		usage
+		exit 0
+		;;
+	home) stop_id="$TRANSPARENTTRANSPORT_HOME" ;;
+	away) stop_id="$TRANSPARENTTRANSPORT_AWAY" ;;
+	*)    stop_id="$@" ;;
+esac
+if test -z "$stop_id"
+then
+	if test -n "$TRANSPARENTTRANSPORT_DEFAULT"
+	then
+		stop_id="$TRANSPARENTTRANSPORT_DEFAULT"
+	else
+		usage
+		exit 1
+	fi
+fi
+
+print_timetable "$(get_stop_finder_id $stop_id)"
